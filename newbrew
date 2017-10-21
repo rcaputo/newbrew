@@ -1,0 +1,169 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+
+my %packages;
+my $time_to_die = 0;
+
+open my $conf, "<", "newbrew.conf" or die $!;
+while (<$conf>) {
+	next if /^\s*$/;
+	next if /^#/;
+	chomp;
+
+	my ($package_name, $options) = split /\s*:\s*/, $_, 2;
+
+	my %package_info;
+
+	my @commands;
+	while ($options =~ s/\!\{\s*(.*?)\s*\}//) {
+		$package_info{commands} //= [ ];
+		push @{$package_info{commands}}, $1;
+	}
+
+	while ($options =~ s/\+(\S+)//) {
+		$package_info{explicit_with}{$1} = 1;
+		if (exists $package_info{explicit_without}{$1}) {
+			warn "package $_ defines both +$1 and -$1\n";
+			++$time_to_die;
+		}
+	}
+
+	while ($options =~ s/(?:^|\s)-(\S+)//) {
+		$package_info{explicit_without}{$1} = 1;
+	}
+
+	$packages{$package_name} = \%package_info;
+}
+close $conf;
+
+my @package_queue = keys %packages;
+while (@package_queue) {
+	my $package_name = shift @package_queue;
+	my $package_info = ( $packages{$package_name} //= { } );
+
+	next if $package_info->{discovered};
+	$package_info->{discovered} = 1;
+
+	warn "Discovering dependencies for package '$package_name'...\n";
+
+	my @all_options = split /\s+/, `brew options --compact '$package_name'`;
+	chomp @all_options;
+
+	my %override_options;
+	foreach (@all_options) {
+		unless (/^--(with(?:out)?)-(\S+)/) {
+			warn "  strange option $_";
+			next;
+		}
+		$override_options{$2} = $1;
+	}
+
+	my @all_deps = sort grep !/^:/, `brew deps -1 --include-optional --include-requirements '$package_name'`;
+	chomp @all_deps;
+
+	my %explicit_with    = %{ $package_info->{explicit_with} // { } };
+	my %explicit_without = %{ $package_info->{explicit_without} // { } };
+
+	foreach (@all_deps) {
+		# Not an option means it's required.
+		unless (exists $override_options{$_}) {
+			$package_info->{deps}{$_} = 'required';
+
+			if (exists $explicit_without{$_}) {
+				delete $explicit_without{$_};
+				warn "package $package_name: custom -$_ cannot exclude required dependency\n";
+			}
+
+			# Explicit doesn't matter.
+			delete $explicit_with{$_};
+
+			next;
+		}
+
+		if ($override_options{$_} eq 'without') {
+			if (exists $explicit_without{$_}) {
+				$package_info->{opts}{"--without-$_"} = 1;
+			}
+			else {
+				$package_info->{deps}{$_} = 'default';
+			}
+		}
+		elsif (exists $explicit_with{$_}) {
+			$package_info->{opts}{"--with-$_"} = 1;
+			$package_info->{deps}{$_} = 'explicit';
+			$package_info->{overrides_options} = 1;
+		}
+
+		delete $explicit_with{$_};
+		delete $explicit_without{$_};
+	}
+
+	$package_info->{opts}{"--with-$_"} = 1 foreach keys %explicit_with;
+	$package_info->{opts}{"--without-$_"} = 1 foreach keys %explicit_without;
+
+	push @package_queue, keys %{ $package_info->{deps} };
+}
+
+# One pass through the build requires to create .PHONY targets.
+@package_queue = keys %packages;
+while (@package_queue) {
+	my $package_name = shift @package_queue;
+
+	my $package_info = $packages{$package_name};
+	unless (defined $packages{$package_name}) {
+		# Can happen if it was added to the queue as a dependency.
+		$package_info = $packages{$package_name} = {
+			is_phony => 1,
+			deps => { },
+		};
+	}
+
+	next if $package_info->{phonied};
+	$package_info->{phonied} = 1;
+
+	warn "Discovering build dependencies for package '$package_name'...\n";
+
+	my @build_deps = sort grep !/^:/, `brew deps -1 --skip-requirements --skip-optional --skip-recommended --include-build '$package_name'`;
+	chomp @build_deps;
+
+	foreach (@build_deps) {
+		$package_info->{deps}{$_} = 'build' unless exists $package_info->{deps}{$_};
+	}
+
+	push @package_queue, @build_deps;
+}
+
+die "Something's wrong above this line. Fix it and try again.\n" if $time_to_die;
+
+warn "Writing Makefile to standard output.\n";
+
+print "all:";
+print " \\\n\t/usr/local/Cellar/$_" foreach sort keys %packages;
+print "\n\n";
+
+foreach my $package_name (sort keys %packages) {
+	my $package_info = $packages{$package_name};
+
+	if ($package_info->{is_phony}) {
+		print ".PHONY: /usr/local/Cellar/$package_name\n";
+	}
+
+	print "/usr/local/Cellar/$package_name:";
+	print " \\\n\t\t/usr/local/Cellar/$_" foreach sort keys %{ $package_info->{deps} };
+
+	if ($package_info->{is_phony}) {
+		print "\n\t\@true";
+	}
+	else {
+		print "\n\tbrew install $package_name";
+		print " \\\n\t\t$_" foreach sort keys %{ $package_info->{opts} };
+	}
+
+	print "\n\n";
+}
+
+#use Data::Dumper;
+#warn Dumper(\%packages);
+
