@@ -13,11 +13,12 @@ while (<>) {
 	next if /^#/;
 	chomp;
 
+	my $original_line = $_;
+
 	my ($package_name, $options) = split /\s*:\s*/, $_, 2;
 
 	my %package_info;
 
-	my @commands;
 	while ($options =~ s/\!\{\s*(.*?)\s*\}//) {
 		$package_info{commands} //= [ ];
 		push @{$package_info{commands}}, $1;
@@ -35,7 +36,17 @@ while (<>) {
 		$package_info{explicit_without}{$1} = 1;
 	}
 
+	if ($options =~ /\S/) {
+		warn "Input line $. is malformed: $original_line\n";
+		warn "  ($options)\n";
+		++$time_to_die;
+	}
+
 	$packages{$package_name} = \%package_info;
+}
+
+if ($time_to_die) {
+	die "Configuration has errors, listed above. Please fix and try again.\n";
 }
 
 my @package_queue = keys %packages;
@@ -54,7 +65,7 @@ while (@package_queue) {
 	my %override_options;
 	foreach (@all_options) {
 		unless (/^--(with(?:out)?)-(\S+)/) {
-			warn "  strange option $_";
+			warn "  Ignoring non-package option: $_\n";
 			next;
 		}
 		$override_options{$2} = $1;
@@ -154,11 +165,12 @@ foreach my $package_name (sort keys %packages) {
 	print " \\\n\t\t/usr/local/Cellar/$_" foreach sort keys %{ $package_info->{deps} };
 
 	if ($package_info->{is_phony}) {
-		print "\n\t\@true";
+		print "\n\t\@echo 'Traversing build-only rule for $package_name.'";
 	}
 	else {
 		print "\n\tbrew install $package_name";
 		print " \\\n\t\t$_" foreach sort keys %{ $package_info->{opts} };
+		print "\n\t$_" foreach @{ $package_info->{commands} // [ ] };
 	}
 
 	print "\n\n";
